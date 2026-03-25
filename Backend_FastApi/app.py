@@ -20,6 +20,7 @@ import httpx
 import numpy as np
 import pandas as pd
 import joblib
+import base64
 
 from fastapi      import FastAPI, HTTPException
 from pydantic     import BaseModel
@@ -38,11 +39,55 @@ app = FastAPI(
 
 MODEL_PATH = "github_suspicious_model_final.pkl"
 
+# =============================================================================
+# SOURCE CODE VULNERABILITY MODEL PATHS
+# =============================================================================
+CODE_MODEL_PATH = "xgb_cybernative.pkl"
+TFIDF_MODEL_PATH = "tfidf_cybernative.pkl"
+CODE_THRESHOLD = 0.45
+
+# CyberNative dataset supported languages/extensions
+ALLOWED_CODE_EXTS = {
+    "py", "js", "java", "php", "go",
+    "cpp", "cs", "rb", "kt", "swift", "f90", "f95", "f03", "f08"
+}
+
+EXT_TO_LANGUAGE = {
+    "py": "python",
+    "js": "javascript",
+    "java": "java",
+    "php": "php",
+    "go": "go",
+    "cpp": "c++",
+    "cc": "c++",
+    "cxx": "c++",
+    "cs": "c#",
+    "rb": "ruby",
+    "kt": "kotlin",
+    "swift": "swift",
+    "f90": "fortran",
+    "f95": "fortran",
+    "f03": "fortran",
+    "f08": "fortran",
+}
+
+
+#cor commit 
 def load_model():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Model file nahi mila: {MODEL_PATH}")
     return joblib.load(MODEL_PATH)
 
+# for Soruce code
+def load_code_model():
+    if not os.path.exists(CODE_MODEL_PATH):
+        raise FileNotFoundError(f"Code vulnerability model nahi mila: {CODE_MODEL_PATH}")
+    return joblib.load(CODE_MODEL_PATH)
+
+def load_tfidf():
+    if not os.path.exists(TFIDF_MODEL_PATH):
+        raise FileNotFoundError(f"TF-IDF model nahi mila: {TFIDF_MODEL_PATH}")
+    return joblib.load(TFIDF_MODEL_PATH)
 # =============================================================================
 # 2. REQUEST / RESPONSE SCHEMAS
 # =============================================================================
@@ -78,6 +123,47 @@ class AnalyzeResponse(BaseModel):
     suspicious_count : int
     suspicious_pct   : float
     results          : list[CommitResult]
+
+# =============================================================================
+# SOURCE CODE SCAN SCHEMAS
+# =============================================================================
+class RepoCodeScanRequest(BaseModel):
+    owner  : str
+    repo   : str
+    branch : str = "main"
+    token  : str
+
+class FileScanResult(BaseModel):
+    filename               : str
+    filepath               : str
+    language               : str
+    prediction             : str
+    safe_probability       : float
+    vulnerable_probability : float
+    confidence             : float
+    risk_level             : str
+
+class RepoCodeScanResponse(BaseModel):
+    repo               : str
+    branch             : str
+    total_files        : int
+    scanned_files      : int
+    vulnerable_files   : int
+    safe_files         : int
+    skipped_files      : int
+    repo_risk          : str
+    repo_risk_score    : float
+    results            : list[FileScanResult]
+
+
+class FullScanResponse(BaseModel):
+    repo              : str
+    branch            : str
+    commit_analysis   : AnalyzeResponse
+    source_code_scan  : RepoCodeScanResponse
+    overall_risk      : str
+    overall_score     : float
+
 
 # =============================================================================
 # 3. FEATURE ENGINEERING
@@ -205,6 +291,225 @@ def predict_df(df: pd.DataFrame) -> list[CommitResult]:
 # =============================================================================
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 
+# =============================================================================
+# 4B. GITHUB SOURCE CODE FETCHER + CODE VULNERABILITY PREDICTOR
+# =============================================================================
+
+def get_file_extension(path: str) -> str:
+    if '.' not in str(path):
+        return 'none'
+    return str(path).rsplit('.', 1)[-1].lower()
+
+def get_language_from_path(path: str) -> str:
+    ext = get_file_extension(path)
+    return EXT_TO_LANGUAGE.get(ext, "unknown")
+
+def is_allowed_code_file(path: str) -> bool:
+    ext = get_file_extension(path)
+    return ext in ALLOWED_CODE_EXTS
+
+def should_skip_path(path: str) -> bool:
+    path = str(path).lower()
+
+    # hidden/system/build folders skip
+    skip_parts = [
+        ".git/", "node_modules/", "dist/", "build/", ".next/",
+        "__pycache__/", ".venv/", "venv/", "target/", "bin/",
+        "obj/", ".idea/", ".vscode/", "coverage/", "vendor/"
+    ]
+
+    return any(part in path for part in skip_parts)
+
+async def fetch_repo_tree(owner: str, repo: str, branch: str, token: str) -> list[dict]:
+    """
+    GitHub REST API se repo ka recursive file tree fetch karega
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Repo tree fetch failed: {resp.text}"
+        )
+
+    data = resp.json()
+
+    if "tree" not in data:
+        raise HTTPException(
+            status_code=400,
+            detail="Repo tree nahi mila — repo/branch check karo"
+        )
+
+    return data["tree"]
+
+async def fetch_file_content(owner: str, repo: str, path: str, token: str) -> str:
+    """
+    GitHub REST API se ek file ka raw content fetch karega
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        return ""
+
+    data = resp.json()
+
+    if isinstance(data, dict) and data.get("type") == "file":
+        content = data.get("content", "")
+        encoding = data.get("encoding", "")
+
+        if encoding == "base64" and content:
+            try:
+                decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
+                return decoded
+            except Exception:
+                return ""
+
+    return ""
+
+def predict_source_code(code_snippet: str, language: str = "unknown") -> dict:
+    """
+    Source code vulnerability model se SAFE / VULNERABLE prediction
+    """
+    if not code_snippet or len(code_snippet.strip()) < 20:
+        return {
+            "language": language,
+            "prediction": "SKIPPED",
+            "safe_probability": 0.0,
+            "vulnerable_probability": 0.0,
+            "confidence": 0.0,
+            "risk_level": "SKIPPED"
+        }
+
+    xgb_code = load_code_model()
+    tfidf    = load_tfidf()
+
+    vec  = tfidf.transform([code_snippet])
+    prob = xgb_code.predict_proba(vec)[0]
+
+    safe_prob = float(prob[0])
+    vuln_prob = float(prob[1])
+
+    pred  = 1 if vuln_prob >= CODE_THRESHOLD else 0
+    label = "VULNERABLE" if pred == 1 else "SAFE"
+
+    if vuln_prob >= 0.80:
+        risk_level = "HIGH"
+    elif vuln_prob >= CODE_THRESHOLD:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    return {
+        "language": language,
+        "prediction": label,
+        "safe_probability": round(safe_prob, 4),
+        "vulnerable_probability": round(vuln_prob, 4),
+        "confidence": round(max(safe_prob, vuln_prob), 4),
+        "risk_level": risk_level
+    }
+
+async def scan_repo_source_code(owner: str, repo: str, branch: str, token: str) -> list[dict]:
+    """
+    Repo ki current branch ki saari supported source files scan karega
+    """
+    tree = await fetch_repo_tree(owner, repo, branch, token)
+
+    # sirf relevant source files lo
+    code_files = []
+    for item in tree:
+        if item.get("type") != "blob":
+            continue
+
+        path = item.get("path", "")
+        if should_skip_path(path):
+            continue
+
+        if is_allowed_code_file(path):
+            code_files.append(path)
+
+    results = []
+
+    for path in code_files:
+        code = await fetch_file_content(owner, repo, path, token)
+        language = get_language_from_path(path)
+
+        pred = predict_source_code(code, language)
+
+        results.append({
+            "filename": os.path.basename(path),
+            "filepath": path,
+            "language": pred["language"],
+            "prediction": pred["prediction"],
+            "safe_probability": pred["safe_probability"],
+            "vulnerable_probability": pred["vulnerable_probability"],
+            "confidence": pred["confidence"],
+            "risk_level": pred["risk_level"]
+        })
+
+    return results
+
+def calculate_repo_risk(results: list[dict]) -> tuple[str, float]:
+    """
+    File-level predictions se final repo risk nikaalega
+    """
+    if not results:
+        return "LOW", 0.0
+
+    vuln_scores = [
+        r["vulnerable_probability"]
+        for r in results
+        if r["prediction"] != "SKIPPED"
+    ]
+
+    if not vuln_scores:
+        return "LOW", 0.0
+
+    avg_score = float(sum(vuln_scores) / len(vuln_scores))
+    vuln_count = sum(1 for r in results if r["prediction"] == "VULNERABLE")
+
+    if vuln_count >= 5 or avg_score >= 0.75:
+        return "HIGH", round(avg_score, 4)
+    elif vuln_count >= 2 or avg_score >= 0.45:
+        return "MEDIUM", round(avg_score, 4)
+    else:
+        return "LOW", round(avg_score, 4)
+
+
+def calculate_overall_risk(commit_resp: AnalyzeResponse, code_resp: RepoCodeScanResponse) -> tuple[str, float]:
+    """
+    Commit behavior + source code scan combine karke final overall risk nikalega
+    """
+    commit_score = commit_resp.suspicious_pct / 100.0
+    code_score   = code_resp.repo_risk_score
+
+    # code risk ko thoda zyada weight
+    overall_score = (0.4 * commit_score) + (0.6 * code_score)
+
+    if overall_score >= 0.75:
+        return "HIGH", round(overall_score, 4)
+    elif overall_score >= 0.45:
+        return "MEDIUM", round(overall_score, 4)
+    else:
+        return "LOW", round(overall_score, 4)
+
+
+
 def build_query(owner: str, repo: str, last_n: int, branch: str) -> str:
     return f"""
     {{
@@ -303,13 +608,30 @@ async def fetch_commits(
 # 5. ROUTES
 # =============================================================================
 
+# @app.get("/health")
+# def health():
+#     model_ok = os.path.exists(MODEL_PATH)
+#     return {
+#         "status"    : "ok" if model_ok else "model missing",
+#         "model_path": MODEL_PATH,
+#         "model_ok"  : model_ok,
+#     }
+
+
 @app.get("/health")
 def health():
-    model_ok = os.path.exists(MODEL_PATH)
+    commit_model_ok = os.path.exists(MODEL_PATH)
+    code_model_ok   = os.path.exists(CODE_MODEL_PATH)
+    tfidf_ok        = os.path.exists(TFIDF_MODEL_PATH)
+
     return {
-        "status"    : "ok" if model_ok else "model missing",
-        "model_path": MODEL_PATH,
-        "model_ok"  : model_ok,
+        "status"          : "ok" if (commit_model_ok and code_model_ok and tfidf_ok) else "some model missing",
+        "commit_model"    : MODEL_PATH,
+        "commit_model_ok" : commit_model_ok,
+        "code_model"      : CODE_MODEL_PATH,
+        "code_model_ok"   : code_model_ok,
+        "tfidf_model"     : TFIDF_MODEL_PATH,
+        "tfidf_ok"        : tfidf_ok,
     }
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -335,9 +657,72 @@ async def analyze_repo(req: RepoRequest):
         results          = results,
     )
 
-# @app.post("/predict/single", response_model=CommitResult)
-# def predict_single(req: SingleCommitRequest):
-#     df      = pd.DataFrame([req.dict()])
-#     df      = engineer_features(df)
-#     results = predict_df(df)
-#     return results[0]
+@app.post("/scan/source-code", response_model=RepoCodeScanResponse)
+async def scan_source_code(req: RepoCodeScanRequest):
+    results = await scan_repo_source_code(
+        req.owner, req.repo, req.branch, req.token
+    )
+
+    if not results:
+        raise HTTPException(
+            status_code=404,
+            detail="Koi supported source code file nahi mili repo me"
+        )
+
+    vulnerable_files = sum(1 for r in results if r["prediction"] == "VULNERABLE")
+    safe_files       = sum(1 for r in results if r["prediction"] == "SAFE")
+    skipped_files    = sum(1 for r in results if r["prediction"] == "SKIPPED")
+
+    repo_risk, repo_risk_score = calculate_repo_risk(results)
+
+    return RepoCodeScanResponse(
+        repo             = f"{req.owner}/{req.repo}",
+        branch           = req.branch,
+        total_files      = len(results),
+        scanned_files    = safe_files + vulnerable_files,
+        vulnerable_files = vulnerable_files,
+        safe_files       = safe_files,
+        skipped_files    = skipped_files,
+        repo_risk        = repo_risk,
+        repo_risk_score  = repo_risk_score,
+        results          = [FileScanResult(**r) for r in results]
+    )
+
+
+@app.post("/scan/full", response_model=FullScanResponse)
+async def full_scan(req: RepoRequest):
+    """
+    Ek hi endpoint se:
+    1) commit behavior analysis
+    2) source code vulnerability scan
+    dono return karega
+    """
+    # Commit behavior
+    commit_resp = await analyze_repo(req)
+
+    # Source code scan
+    code_req = RepoCodeScanRequest(
+        owner=req.owner,
+        repo=req.repo,
+        branch=req.branch,
+        token=req.token
+    )
+    code_resp = await scan_source_code(code_req)
+
+    overall_risk, overall_score = calculate_overall_risk(commit_resp, code_resp)
+
+    return FullScanResponse(
+        repo             = f"{req.owner}/{req.repo}",
+        branch           = req.branch,
+        commit_analysis  = commit_resp,
+        source_code_scan = code_resp,
+        overall_risk     = overall_risk,
+        overall_score    = overall_score
+    )
+
+@app.post("/predict/single", response_model=CommitResult)
+def predict_single(req: SingleCommitRequest):
+    df      = pd.DataFrame([req.dict()])
+    df      = engineer_features(df)
+    results = predict_df(df)
+    return results[0]

@@ -22,11 +22,12 @@ import pandas as pd
 import joblib
 import base64
 
-from fastapi      import FastAPI, HTTPException
-from pydantic     import BaseModel
-from typing       import Optional
-from collections  import deque
-from datetime     import datetime
+from fastapi                 import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic                import BaseModel
+from typing                  import Optional
+from collections             import deque
+from datetime                import datetime
 
 # =============================================================================
 # 1. APP SETUP
@@ -35,6 +36,17 @@ app = FastAPI(
     title       = "GitHub Suspicious Commit Detector",
     description = "GraphQL se commits fetch karke ML model se analyze karta hai",
     version     = "1.0.0"
+)
+
+# -----------------------------------------------------------------------------
+# CORS — Vercel frontend ke liye zaroori hai
+# -----------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins     = ["*"],   # Production me apna Vercel URL daal sakte ho
+    allow_credentials = True,
+    allow_methods     = ["*"],   # OPTIONS preflight bhi allow hoga
+    allow_headers     = ["*"],
 )
 
 MODEL_PATH = "github_suspicious_model_final.pkl"

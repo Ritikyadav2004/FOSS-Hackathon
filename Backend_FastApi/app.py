@@ -689,36 +689,68 @@ async def scan_source_code(req: RepoCodeScanRequest):
     )
 
 
+# @app.post("/scan/full", response_model=FullScanResponse)
+# async def full_scan(req: RepoRequest):
+#     """
+#     Ek hi endpoint se:
+#     1) commit behavior analysis
+#     2) source code vulnerability scan
+#     dono return karega
+#     """
+#     # Commit behavior
+#     commit_resp = await analyze_repo(req)
+
+#     # Source code scan
+#     code_req = RepoCodeScanRequest(
+#         owner=req.owner,
+#         repo=req.repo,
+#         branch=req.branch,
+#         token=req.token
+#     )
+#     code_resp = await scan_source_code(code_req)
+
+#     overall_risk, overall_score = calculate_overall_risk(commit_resp, code_resp)
+
+#     return FullScanResponse(
+#         repo             = f"{req.owner}/{req.repo}",
+#         branch           = req.branch,
+#         commit_analysis  = commit_resp,
+#         source_code_scan = code_resp,
+#         overall_risk     = overall_risk,
+#         overall_score    = overall_score
+#     )
+
+
 @app.post("/scan/full", response_model=FullScanResponse)
 async def full_scan(req: RepoRequest):
-    """
-    Ek hi endpoint se:
-    1) commit behavior analysis
-    2) source code vulnerability scan
-    dono return karega
-    """
-    # Commit behavior
-    commit_resp = await analyze_repo(req)
+    try:
+        # 1. Commit analysis check
+        commit_resp = await analyze_repo(req)
+        
+        # 2. Source code scan check
+        code_req = RepoCodeScanRequest(
+            owner=req.owner,
+            repo=req.repo,
+            branch=req.branch,
+            token=req.token
+        )
+        code_resp = await scan_source_code(code_req)
 
-    # Source code scan
-    code_req = RepoCodeScanRequest(
-        owner=req.owner,
-        repo=req.repo,
-        branch=req.branch,
-        token=req.token
-    )
-    code_resp = await scan_source_code(code_req)
+        # 3. Risk calculation
+        overall_risk, overall_score = calculate_overall_risk(commit_resp, code_resp)
 
-    overall_risk, overall_score = calculate_overall_risk(commit_resp, code_resp)
-
-    return FullScanResponse(
-        repo             = f"{req.owner}/{req.repo}",
-        branch           = req.branch,
-        commit_analysis  = commit_resp,
-        source_code_scan = code_resp,
-        overall_risk     = overall_risk,
-        overall_score    = overall_score
-    )
+        return FullScanResponse(
+            repo             = f"{req.owner}/{req.repo}",
+            branch           = req.branch,
+            commit_analysis  = commit_resp,
+            source_code_scan = code_resp,
+            overall_risk     = overall_risk,
+            overall_score    = overall_score
+        )
+    except Exception as e:
+        # Ye line Railway logs mein error print karegi
+        print(f"DETAILED ERROR: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Internal Error: {str(e)}")
 
 @app.post("/predict/single", response_model=CommitResult)
 def predict_single(req: SingleCommitRequest):
